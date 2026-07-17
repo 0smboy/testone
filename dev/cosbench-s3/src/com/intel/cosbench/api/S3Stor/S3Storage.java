@@ -1,0 +1,199 @@
+package com.intel.cosbench.api.S3Stor;
+
+import static com.intel.cosbench.client.S3Stor.S3Constants.*;
+
+import java.io.*;
+import java.util.List;
+import java.util.Random;
+
+import org.apache.http.HttpStatus;
+
+import com.amazonaws.*;
+import com.amazonaws.auth.*;
+import com.amazonaws.services.s3.*;
+import com.amazonaws.services.s3.model.*;
+
+import com.intel.cosbench.api.storage.*;
+import com.intel.cosbench.api.context.*;
+import com.intel.cosbench.config.Config;
+import com.intel.cosbench.log.Logger;
+
+/**
+ * S3 storage adapter with community patches:
+ * - PR #351: optional range GET (is_range_request / range_start / range_end)
+ * - PR #424: listObjects via getList
+ */
+public class S3Storage extends NoneStorage {
+    private int timeout;
+
+    private String accessKey;
+    private String secretKey;
+    private String endpoint;
+
+    private boolean isRangeRequest;
+    private int rangeStart;
+    private int rangeEnd;
+
+    private AmazonS3 client;
+
+    @Override
+    public void init(Config config, Logger logger) {
+        super.init(config, logger);
+
+        timeout = config.getInt(CONN_TIMEOUT_KEY, CONN_TIMEOUT_DEFAULT);
+        parms.put(CONN_TIMEOUT_KEY, timeout);
+
+        endpoint = config.get(ENDPOINT_KEY, ENDPOINT_DEFAULT);
+        accessKey = config.get(AUTH_USERNAME_KEY, AUTH_USERNAME_DEFAULT);
+        secretKey = config.get(AUTH_PASSWORD_KEY, AUTH_PASSWORD_DEFAULT);
+
+        boolean pathStyleAccess = config.getBoolean(PATH_STYLE_ACCESS_KEY, PATH_STYLE_ACCESS_DEFAULT);
+
+        String proxyHost = config.get(PROXY_HOST_KEY, "");
+        String proxyPort = config.get(PROXY_PORT_KEY, "");
+
+        isRangeRequest = config.getBoolean("is_range_request", false);
+        rangeStart = config.getInt("range_start", 0);
+        rangeEnd = config.getInt("range_end", 4096);
+
+        parms.put(ENDPOINT_KEY, endpoint);
+        parms.put(AUTH_USERNAME_KEY, accessKey);
+        parms.put(AUTH_PASSWORD_KEY, secretKey);
+        parms.put(PATH_STYLE_ACCESS_KEY, pathStyleAccess);
+        parms.put(PROXY_HOST_KEY, proxyHost);
+        parms.put(PROXY_PORT_KEY, proxyPort);
+        parms.put("is_range_request", isRangeRequest);
+        parms.put("range_start", rangeStart);
+        parms.put("range_end", rangeEnd);
+
+        logger.debug("using storage config: {}", parms);
+
+        ClientConfiguration clientConf = new ClientConfiguration();
+        clientConf.setConnectionTimeout(timeout);
+        clientConf.setSocketTimeout(timeout);
+        clientConf.withUseExpectContinue(false);
+        clientConf.withSignerOverride("S3SignerType");
+        if ((!proxyHost.equals("")) && (!proxyPort.equals(""))) {
+            clientConf.setProxyHost(proxyHost);
+            clientConf.setProxyPort(Integer.parseInt(proxyPort));
+        }
+
+        AWSCredentials myCredentials = new BasicAWSCredentials(accessKey, secretKey);
+        client = new AmazonS3Client(myCredentials, clientConf);
+        client.setEndpoint(endpoint);
+        client.setS3ClientOptions(new S3ClientOptions().withPathStyleAccess(pathStyleAccess));
+
+        logger.debug("S3 client has been initialized");
+    }
+
+    @Override
+    public void setAuthContext(AuthContext info) {
+        super.setAuthContext(info);
+    }
+
+    @Override
+    public void dispose() {
+        super.dispose();
+        client = null;
+    }
+
+    @Override
+    public InputStream getObject(String container, String object, Config config) {
+        super.getObject(container, object, config);
+        InputStream stream;
+        try {
+            if (isRangeRequest) {
+                GetObjectRequest rangeObjectRequest = new GetObjectRequest(container, object);
+                Random rand = new Random();
+                int span = Math.max(0, rangeEnd - rangeStart);
+                int a = rangeStart + (span == 0 ? 0 : rand.nextInt(span + 1));
+                int b = rangeStart + (span == 0 ? 0 : rand.nextInt(span + 1));
+                long start = Math.min(a, b);
+                long end = Math.max(a, b);
+                rangeObjectRequest.setRange(start, end);
+                S3Object objectPortion = client.getObject(rangeObjectRequest);
+                stream = objectPortion.getObjectContent();
+            } else {
+                S3Object s3Obj = client.getObject(container, object);
+                stream = s3Obj.getObjectContent();
+            }
+        } catch (Exception e) {
+            throw new StorageException(e);
+        }
+        return stream;
+    }
+
+    @Override
+    public InputStream getList(String container, String prefix, Config config) {
+        super.getList(container, prefix, config);
+        InputStream stream;
+        try {
+            ObjectListing s3ObjList = client.listObjects(container, prefix);
+            List<S3ObjectSummary> objSummaries = s3ObjList.getObjectSummaries();
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            for (S3ObjectSummary s : objSummaries) {
+                baos.write(s.toString().getBytes());
+            }
+            stream = new ByteArrayInputStream(baos.toByteArray());
+        } catch (Exception e) {
+            throw new StorageException(e);
+        }
+        return stream;
+    }
+
+    @Override
+    public void createContainer(String container, Config config) {
+        super.createContainer(container, config);
+        try {
+            if (!client.doesBucketExist(container)) {
+                client.createBucket(container);
+            }
+        } catch (Exception e) {
+            throw new StorageException(e);
+        }
+    }
+
+    @Override
+    public void createObject(String container, String object, InputStream data,
+            long length, Config config) {
+        super.createObject(container, object, data, length, config);
+        try {
+            ObjectMetadata metadata = new ObjectMetadata();
+            metadata.setContentLength(length);
+            metadata.setContentType("application/octet-stream");
+            client.putObject(container, object, data, metadata);
+        } catch (Exception e) {
+            throw new StorageException(e);
+        }
+    }
+
+    @Override
+    public void deleteContainer(String container, Config config) {
+        super.deleteContainer(container, config);
+        try {
+            if (client.doesBucketExist(container)) {
+                client.deleteBucket(container);
+            }
+        } catch (AmazonS3Exception awse) {
+            if (awse.getStatusCode() != HttpStatus.SC_NOT_FOUND) {
+                throw new StorageException(awse);
+            }
+        } catch (Exception e) {
+            throw new StorageException(e);
+        }
+    }
+
+    @Override
+    public void deleteObject(String container, String object, Config config) {
+        super.deleteObject(container, object, config);
+        try {
+            client.deleteObject(container, object);
+        } catch (AmazonS3Exception awse) {
+            if (awse.getStatusCode() != HttpStatus.SC_NOT_FOUND) {
+                throw new StorageException(awse);
+            }
+        } catch (Exception e) {
+            throw new StorageException(e);
+        }
+    }
+}
